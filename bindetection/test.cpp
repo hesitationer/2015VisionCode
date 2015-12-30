@@ -1,9 +1,10 @@
 #include <iostream>
-#include <stdio.h>
+#include <iomanip>
+#include <cstdio>
+#include <ctime>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <time.h>
 
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
@@ -14,8 +15,8 @@
 #include "networktables2/type/NumberArray.h"
 
 #include "classifierio.hpp"
+#include "detectstate.hpp"
 #include "frameticker.hpp"
-#include "imagedetect.hpp"
 #include "videoin.hpp"
 #include "imagein.hpp"
 #include "camerain.hpp"
@@ -27,55 +28,37 @@
 using namespace std;
 using namespace cv;
 
-void writeImage(const Mat &frame, const vector<Rect> &rects, size_t index, const char *path, int frameCounter);
-string getDateTimeString(void);
-
-// Allow switching between CPU and GPU for testing 
-enum CLASSIFIER_MODE
-{
-	CLASSIFIER_MODE_UNINITIALIZED,
-	CLASSIFIER_MODE_RELOAD,
-	CLASSIFIER_MODE_CPU,
-	CLASSIFIER_MODE_GPU
-};
-
 //function prototypes
 void writeImage(const Mat &frame, const vector<Rect> &rects, size_t index, const char *path, int frameCounter);
 string getDateTimeString(void);
-void writeNetTableNumber(NetworkTable *netTable, string label, int index, double value);
 void writeNetTableBoolean(NetworkTable *netTable, string label, int index, bool value);
 void drawRects(Mat image,vector<Rect> detectRects);
 void drawTrackingInfo(Mat &frame, vector<TrackedObjectDisplay> &displayList);
 void checkDuplicate (vector<Rect> detectRects);
 void openMedia(const string &fileName, MediaIn *&cap, string &capPath, string &windowName, bool gui);
-string getVideoOutName(void);
+void openVideoCap(const string &fileName, VideoIn *&cap, string &capPath, string &windowName, bool gui);
+string getVideoOutName(bool raw = true);
+void writeVideoToFile(VideoWriter &outputVideo, const char *filename, const Mat &frame, NetworkTable *netTable, bool dateAndTime);
 
-bool maybeReloadClassifier(BaseCascadeDetect *&detectClassifier, CLASSIFIER_MODE &modeCurrent, CLASSIFIER_MODE &modeNext, const ClassifierIO &classifierIO);
-
-double roundTo(double in, int decPlace){
-	in = in * pow(10, decPlace);
-	in = round(in);
-	in = in / pow(10, decPlace);
-	return in;
-}
-
-void drawRects(Mat image,vector<Rect> detectRects) {
-	for(size_t i = 0; i < detectRects.size(); i++) {
+void drawRects(Mat image,vector<Rect> detectRects) 
+{
+    for(vector<Rect>::const_iterator it = detectRects.begin(); it != detectRects.end(); ++it)
+	{
 		// Mark detected rectangle on image
 		// Change color based on direction we think the bin is pointing
-	        Scalar rectColor = Scalar(0,0,255);
-	        rectangle( image, detectRects[i], rectColor, 3);
+	    Scalar rectColor = Scalar(0,0,255);
+	    rectangle(image, *it, rectColor, 3);
 		// Label each outlined image with a digit.  Top-level code allows
 		// users to save these small images by hitting the key they're labeled with
 		// This should be a quick way to grab lots of falsly detected images
 		// which need to be added to the negative list for the next
 		// pass of classifier training.
+		size_t i = it - detectRects.begin();
 		if (i < 10)
 		{
 			stringstream label;
 			label << i;
-			putText(image, label.str(), Point(detectRects[i].x+10, detectRects[i].y+30), 
-				FONT_HERSHEY_PLAIN, 2.0, Scalar(0, 0, 255));
+			putText(image, label.str(), Point(it->x+10, it->y+30), FONT_HERSHEY_PLAIN, 2.0, rectColor);
 		}
 	}
 }
@@ -97,12 +80,10 @@ void drawTrackingInfo(Mat &frame, vector<TrackedObjectDisplay> &displayList)
 		 // Write detect ID, distance and angle data
 		 putText(frame, it->id, Point(it->rect.x+25, it->rect.y+30), FONT_HERSHEY_PLAIN, 2.0, rectColor);
 		 stringstream distLabel;
-		 distLabel << "D=";
-		 distLabel << roundTo(it->distance,roundDistTo);
+		 distLabel << "D=" << fixed << setprecision(roundDistTo) << it->distance;
 		 putText(frame, distLabel.str(), Point(it->rect.x+10, it->rect.y-10), FONT_HERSHEY_PLAIN, 1.2, rectColor);
 		 stringstream angleLabel;
-		 angleLabel << "A=";
-		 angleLabel << roundTo(it->angle,roundAngTo);
+		 angleLabel << "A=" << fixed << setprecision(roundAngTo) << it->angle;
 		 putText(frame, angleLabel.str(), Point(it->rect.x+10, it->rect.y+it->rect.height+20), FONT_HERSHEY_PLAIN, 1.2, rectColor);
 	  }
    }
@@ -135,8 +116,6 @@ void checkDuplicate (vector<Rect> detectRects) {
 	}
 }
 
-void openVideoCap(const string &fileName, VideoIn *&cap, string &capPath, string &windowName, bool gui);
-string getVideoOutName(void);
 
 int main( int argc, const char** argv )
 {
@@ -145,14 +124,6 @@ int main( int argc, const char** argv )
 	bool printFrames = false; // print frame number?
 	int frameDisplayFrequency = 1;
    
-	CLASSIFIER_MODE classifierModeCurrent = CLASSIFIER_MODE_UNINITIALIZED;
-	CLASSIFIER_MODE classifierModeNext    = CLASSIFIER_MODE_CPU;
-	if (gpu::getCudaEnabledDeviceCount() > 0)
-		classifierModeNext = CLASSIFIER_MODE_GPU;
-
-	// Pointer to either CPU or GPU classifier
-	BaseCascadeDetect *detectClassifier = NULL;
-
 	// Read through command line args, extract
 	// cmd line parameters and input filename
 	Args args;
@@ -206,18 +177,17 @@ int main( int argc, const char** argv )
 	netTableArray.setSize(netTableArraySize * 3);
 
 	// Code to write video frames to avi file on disk
-	string videoOutName = getVideoOutName();
-	Size S(cap->width(), cap->height());
 	VideoWriter outputVideo;
-	VideoWriter save;
+	VideoWriter markedupVideo;
 	args.writeVideo = netTable->GetBoolean("WriteVideo", args.writeVideo);
 	const int videoWritePollFrequency = 30; // check for network table entry every this many frames (~5 seconds or so)
 	int videoWritePollCount = videoWritePollFrequency;
 
 	FrameTicker frameTicker;
 
-	ClassifierIO classifierIO(args.classifierBaseDir, args.classifierDirNum, args.classifierStageNum);
-
+	DetectState detectState(
+		  ClassifierIO(args.classifierBaseDir, args.classifierDirNum, args.classifierStageNum), 
+		  gpu::getCudaEnabledDeviceCount() > 0);
 	// Start of the main loop
 	//  -- grab a frame
 	//  -- update the angle of tracked objects 
@@ -231,18 +201,10 @@ int main( int argc, const char** argv )
 			args.writeVideo = netTable->GetBoolean("WriteVideo", args.writeVideo);
 			videoWritePollCount = videoWritePollFrequency;
 		}
-		if (args.writeVideo) {
-			if (args.saveVideo && !save.isOpened())
-				save.open("record.avi", CV_FOURCC('P','I','M','1'), 20, S, true);
-			if (!outputVideo.isOpened())
-				outputVideo.open(videoOutName.c_str(), CV_FOURCC('M','J','P','G'), 15, S, true);
-			WriteOnFrame textWriter(frame);
-			string matchNum = netTable->GetString("Match Number", "No Match Number");
-			double matchTime = netTable->GetNumber("Match Time",-1);
-			textWriter.writeMatchNumTime(matchNum,matchTime);
-			textWriter.writeTime();
-			textWriter.write(outputVideo);
-		}
+
+		if (args.writeVideo)
+		   writeVideoToFile(outputVideo, getVideoOutName().c_str(), frame, netTable, true);
+
 		//TODO : grab angle delta from robot
 		// Adjust the position of all of the detected objects
 		// to account for movement of the robot between frames
@@ -254,21 +216,31 @@ int main( int argc, const char** argv )
 		// It also handles cases where the user changes the classifer
 		// being used - this forces a reload
 		// Finally, it allows a switch between CPU and GPU on the fly
-		if (!maybeReloadClassifier(detectClassifier, classifierModeCurrent, classifierModeNext, classifierIO))
+		if (detectState.update() == false)
 			return -1;
 
 		// Apply the classifier to the frame
 		// detectRects is a vector of rectangles, one for each detected object
 		vector<Rect> detectRects;
-		detectClassifier->cascadeDetect(frame, detectRects); 
+		detectState.detector()->Detect(frame, detectRects); 
 		checkDuplicate(detectRects);
+
+		// If args.captureAll is enabled, write each detected rectangle
+		// to their own output image file. Do it before anything else
+		// so there's nothing else drawn to frame yet, just the raw
+		// input image
+		if (args.captureAll)
+			for (size_t index = 0; index < detectRects.size(); index++)
+				writeImage(frame, detectRects, index, capPath.c_str(), cap->frameCounter());
+
+		// Draw detected rectangles on frame
 		if (!args.batchMode && args.rects && ((cap->frameCounter() % frameDisplayFrequency) == 0))
 			drawRects(frame,detectRects);
 
 		// Process this detected rectangle - either update the nearest
 		// object or add it as a new one
-		for(size_t i = 0; i < detectRects.size(); i++)
-			binTrackingList.processDetect(detectRects[i]);
+		for(vector<Rect>::const_iterator it = detectRects.begin(); it != detectRects.end(); ++it)
+			binTrackingList.processDetect(*it);
 		#if 0
 		// Print detect status of live objects
 		if (args.tracking)
@@ -277,19 +249,20 @@ int main( int argc, const char** argv )
 		// Grab info from trackedobjects. Display it and update network tables
 		vector<TrackedObjectDisplay> displayList;
 		binTrackingList.getDisplay(displayList);
-		// Clear out network table array
-		for (size_t i = 0; !args.ds & (i < (netTableArraySize * 3)); i++)
-			netTableArray.set(i, -1);
 
 		// Draw tracking info on display if 
 		//   a. tracking is toggled on
 		//   b. batch (non-GUI) mode isn't active
 		//   c. we're on one of the frames to display (every frDispFreq frames)
 		if (args.tracking && !args.batchMode && ((cap->frameCounter() % frameDisplayFrequency) == 0))
-			  drawTrackingInfo(frame, displayList);
+		    drawTrackingInfo(frame, displayList);
 
 		if (!args.ds)
 		{
+		   // Clear out network table array
+		   for (size_t i = 0; !args.ds & (i < (netTableArraySize * 3)); i++)
+			   netTableArray.set(i, -1);
+
 		   for (size_t i = 0; i < min(displayList.size(), netTableArraySize); i++)
 		   {
 			  netTableArray.set(i*3,   displayList[i].ratio);
@@ -321,16 +294,11 @@ int main( int argc, const char** argv )
 			{
 				ss << cap->frameCounter();
 				if (frames > 0)
-				{
-					ss << '/';
-					ss << frames;
-				}
+				   ss << '/' << frames;
 				ss << " : ";
 			}
 			// Print the FPS
-			ss.precision(3);
-			ss << frameTicker.getFPS();
-			ss << " FPS";
+			ss << fixed << setprecision(2) << frameTicker.getFPS() << "FPS";
 			if (!args.batchMode)
 				putText(frame, ss.str(), Point(frame.cols - 15 * ss.str().length(), 50), FONT_HERSHEY_PLAIN, 1.5, Scalar(0,0,255));
 			else
@@ -352,12 +320,12 @@ int main( int argc, const char** argv )
 				// rectangle contained entirely in the quadrant
 				// Assume that if that's found, it is a bin
 				// TODO : Tune this later with a distance range
-				for( size_t j = 0; j < displayList.size(); j++ ) 
+				for (vector<TrackedObjectDisplay>::const_iterator it = displayList.begin(); it != displayList.end(); ++it)
 				{
-					if (((displayList[j].rect & dsRect) == displayList[j].rect) && (displayList[j].ratio > 0.15))
+					if (((it->rect & dsRect) == it->rect) && (it->ratio > 0.15))
 					{
 						if (!args.batchMode && ((cap->frameCounter() % frameDisplayFrequency) == 0))
-							rectangle(frame, displayList[j].rect, Scalar(255,128,128), 3);
+							rectangle(frame, it->rect, Scalar(255,128,128), 3);
 						hits[i] = true;
 					}
 				}
@@ -381,36 +349,31 @@ int main( int argc, const char** argv )
 			if (printFrames && (frames > 0))
 			{
 				stringstream ss;
-				ss << cap->frameCounter();
-				ss << '/';
-				ss << frames;
-				putText(frame, ss.str(), Point(frame.cols - 15 * ss.str().length(), 20), FONT_HERSHEY_PLAIN, 1.5, Scalar(0,0,255));
+				ss << cap->frameCounter() << '/' << frames;
+				putText(frame, ss.str(), 
+				        Point(frame.cols - 15 * ss.str().length(), 20), 
+						FONT_HERSHEY_PLAIN, 1.5, Scalar(0,0,255));
 			}
 
 			// Display current classifier under test
-			{
-				stringstream ss;
-				ss << classifierIO.dirNum();
-				ss << ',';
-				ss << classifierIO.stageNum();
-				putText(frame, ss.str(), Point(0, frame.rows- 30), FONT_HERSHEY_PLAIN, 1.5, Scalar(0,0,255));
-			}
+			putText(frame, detectState.print(), 
+			        Point(0, frame.rows - 30), FONT_HERSHEY_PLAIN, 
+					1.5, Scalar(0,0,255));
 
 			// Display crosshairs so we can line up the camera
 			if (args.calibrate)
 			{
-			   line (frame, Point(frame.cols/2, 0) , Point(frame.cols/2, frame.rows), Scalar(255,255,0  ));
-			   line (frame, Point(0, frame.rows/2) , Point(frame.cols, frame.rows/2), Scalar(255,255,0  ));
+			   line (frame, Point(frame.cols/2, 0) , Point(frame.cols/2, frame.rows), Scalar(255,255,0));
+			   line (frame, Point(0, frame.rows/2) , Point(frame.cols, frame.rows/2), Scalar(255,255,0));
 			}
 			
 			// Main call to display output for this frame after all
 			// info has been written on it.
 			imshow( windowName, frame );
+
+			// If saveVideo is set, write the marked-up frame to a vile
 			if (args.saveVideo)
-			{
-			   WriteOnFrame textWriterForSave(frame);
-			   textWriterForSave.write(save);
-			}
+			   writeVideoToFile(markedupVideo, getVideoOutName(false).c_str(), frame, netTable, false);
 
 			char c = waitKey(5);
 			if ((c == 'c') || (c == 'q') || (c == 27)) 
@@ -463,30 +426,23 @@ int main( int argc, const char** argv )
 			}
 			else if (c == 'G') // toggle CPU/GPU mode
 			{
-				if (classifierModeNext == CLASSIFIER_MODE_GPU)
-					classifierModeNext = CLASSIFIER_MODE_CPU;
-				else
-					classifierModeNext = CLASSIFIER_MODE_GPU;
+				detectState.toggleGPU();
 			}
 			else if (c == '.') // higher classifier stage
 			{
-				if (classifierIO.findNextClassifierStage(true))
-					classifierModeNext = CLASSIFIER_MODE_RELOAD;
+				detectState.changeSubModel(true);
 			}
 			else if (c == ',') // lower classifier stage
 			{
-				if (classifierIO.findNextClassifierStage(false))
-					classifierModeNext = CLASSIFIER_MODE_RELOAD;
+				detectState.changeSubModel(false);
 			}
 			else if (c == '>') // higher classifier dir num
 			{
-				if (classifierIO.findNextClassifierDir(true))
-					classifierModeNext = CLASSIFIER_MODE_RELOAD;
+				detectState.changeModel(true);
 			}
-			else if (c == '<') // higher classifier dir num
+			else if (c == '<') // lower classifier dir num
 			{
-				if (classifierIO.findNextClassifierDir(false))
-					classifierModeNext = CLASSIFIER_MODE_RELOAD;
+				detectState.changeModel(false);
 			}
 			else if (isdigit(c)) // save a single detected image
 			{
@@ -496,19 +452,14 @@ int main( int argc, const char** argv )
 			}
 		}
 
-		// If args.captureAll is enabled, write each detected rectangle
-		// to their own output image file
-		if (args.captureAll && detectRects.size())
-		{
-			// Save from a copy rather than the original
-			// so all the markup isn't saved, only the raw image
-			Mat frameCopy;
-			cap->getNextFrame(frameCopy, true);
-			for (size_t index = 0; index < detectRects.size(); index++)
-				writeImage(frameCopy, detectRects, index, capPath.c_str(), cap->frameCounter());
-		}
 		// Save frame time for the current frame
 		frameTicker.end();
+
+		// Skip over frames if needed - useful for batch extracting hard negatives
+		// so we don't get negatives from every frame. Sequential frames will be
+		// pretty similar so there will be lots of redundant images found
+		if (args.skip > 0)
+		   cap->frameCounter(cap->frameCounter() + args.skip - 1);
 	}
 	return 0;
 }
@@ -526,12 +477,7 @@ void writeImage(const Mat &frame, const vector<Rect> &rects, size_t index, const
       Mat image = frame(rects[index]);
       // Create filename, save image
       stringstream fn;
-      fn << "negative/";
-      fn << path;
-      fn << "_";
-      fn << frameCounter;
-      fn << "_";
-      fn << index;
+      fn << "negative/" << path << "_" << frameCounter << "_" << index;
       imwrite(fn.str() + ".png", image);
 
       // Save grayscale equalized version
@@ -561,13 +507,7 @@ string getDateTimeString(void)
    timeinfo = localtime (&rawtime);
 
    stringstream ss;
-   ss << timeinfo->tm_mon + 1;
-   ss << "-";
-   ss << timeinfo->tm_mday;
-   ss << "_";
-   ss << timeinfo->tm_hour;
-   ss << "_";
-   ss << timeinfo->tm_min;
+   ss << timeinfo->tm_mon + 1 << "-" << timeinfo->tm_mday << "_" << timeinfo->tm_hour << "_" << timeinfo->tm_min;
    return ss.str();
 }
 
@@ -618,94 +558,54 @@ void openMedia(const string &fileName, MediaIn *&cap, string &capPath, string &w
    }
 }
 
-void writeNetTableNumber(NetworkTable *netTable, string label, int index, double value)
-{
-   stringstream ss;
-   ss << label;
-   ss << (index+1);
-   netTable->PutNumber(ss.str().c_str(), value);
-}
-
 void writeNetTableBoolean(NetworkTable *netTable, string label, int index, bool value)
 {
    stringstream ss;
-   ss << label;
-   ss << (index+1);
+   ss << label << index+1;
    netTable->PutBoolean(ss.str().c_str(), value);
 }
 
-// Code to allow switching between CPU and GPU for testing
-// Also used to reload different classifer stages on the fly
-bool maybeReloadClassifier(BaseCascadeDetect *&detectClassifier, 
-      CLASSIFIER_MODE &modeCurrent, 
-      CLASSIFIER_MODE &modeNext, 
-      const ClassifierIO &classifierIO)
-{
-   if ((modeCurrent == CLASSIFIER_MODE_UNINITIALIZED) || 
-       (modeCurrent != modeNext))
-   {
-		string name = classifierIO.getClassifierName();
-		cerr << name << endl;
-
-		// If reloading with new name, keep the current
-		// CPU/GPU mode setting 
-		if (modeNext == CLASSIFIER_MODE_RELOAD)
-			modeNext = modeCurrent;
-
-		// Delete the old classifier if it has been initialized
-		if (detectClassifier)
-			delete detectClassifier;
-
-		// Create a new CPU or GPU  based on the
-		// user's selection
-		if (modeNext == CLASSIFIER_MODE_GPU)
-			detectClassifier = new GPU_CascadeDetect(name.c_str());
-		else
-			detectClassifier = new CPU_CascadeDetect(name.c_str());
-      	modeCurrent = modeNext;
-
-		// Verfiy the load
-		if( !detectClassifier->loaded() )
-		{
-			cerr << "--(!)Error loading " << name << endl; 
-			return false; 
-		}
-   }
-   return true;
-}
 // Video-MM-DD-YY_hr-min-sec-##.avi
-string getVideoOutName(void)
+string getVideoOutName(bool raw)
 {
 	int index = 0;
 	int rc;
 	struct stat statbuf;
 	stringstream ss;
+	time_t rawtime;
+	struct tm * timeinfo;
+	time (&rawtime);
+	timeinfo = localtime (&rawtime);
 	do 
 	{
 		ss.str(string(""));
 		ss.clear();
-		ss << "Video-";
-		time_t rawtime;
-		struct tm * timeinfo;
-		time (&rawtime);
-		timeinfo = localtime (&rawtime);
-		ss << timeinfo->tm_mon + 1;
-		ss << "-";
-		ss << timeinfo->tm_mday;
-		ss << "-";
-		ss << timeinfo->tm_year+1900;
-		ss << "_";
-		ss << timeinfo->tm_hour;
-		ss << "-";
-		ss << timeinfo->tm_min;
-		ss << "-";
-		ss << timeinfo->tm_sec;
-		ss << "-";
+		ss << "Video-" << timeinfo->tm_mon + 1 << "-" << timeinfo->tm_mday << "-" << timeinfo->tm_year+1900 << "_";
+		ss << timeinfo->tm_hour << "-" << timeinfo->tm_min << "-" << timeinfo->tm_sec << "-";
 		ss << index++;
+		if (raw == false)
+		   ss << "_processed";
 		ss << ".avi";
 		rc = stat(ss.str().c_str(), &statbuf);
 	}
 	while (rc == 0);
 	return ss.str();
+}
+
+// Write a frame to an output video
+// optionally, if dateAndTime is set, stamp the date, time and match information to the frame before writing
+void writeVideoToFile(VideoWriter &outputVideo, const char *filename, const Mat &frame, NetworkTable *netTable, bool dateAndTime)
+{
+   if (!outputVideo.isOpened())
+	  outputVideo.open(filename, CV_FOURCC('M','J','P','G'), 15, Size(frame.cols, frame.rows), true);
+   WriteOnFrame textWriter(frame);
+   if (dateAndTime)
+   {
+	  string matchNum  = netTable->GetString("Match Number", "No Match Number");
+	  double matchTime = netTable->GetNumber("Match Time",-1);
+	  textWriter.writeMatchNumTime(matchNum,matchTime);
+	  textWriter.writeTime();
+   }
+   textWriter.write(outputVideo);
 }
 

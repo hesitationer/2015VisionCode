@@ -10,7 +10,7 @@ CameraIn::CameraIn(int stream, bool gui)
    _cap.set(CV_CAP_PROP_FPS, 30.0);
    _cap.set(CV_CAP_PROP_FRAME_WIDTH, 800);
    _cap.set(CV_CAP_PROP_FRAME_HEIGHT, 600);
-   // TODO : Set FPS?
+   _frameCounter = 0;
 }
 
 bool CameraIn::getNextFrame(Mat &frame, bool pause)
@@ -37,4 +37,9 @@ int CameraIn::height(void)
 int CameraIn::width(void)
 {
    return _cap.get(CV_CAP_PROP_FRAME_WIDTH);
+}
+
+int CameraIn::frameCounter(void)
+{
+   return _frameCounter;
 }
